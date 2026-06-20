@@ -329,7 +329,7 @@ def start_vllm(target_model, port, served_name, extra_args=None, tp=1,
         "--served-model-name",   served_name,
         "--max-model-len",       "2048",
         "--gpu-memory-utilization", "0.85",
-        "--disable-log-requests",
+        "--no-enable-log-requests",
     ]
     if tp > 1:
         cmd += ["--tensor-parallel-size", str(tp)]
@@ -657,7 +657,7 @@ def main():
             "--served-model-name", "baseline",
             "--max-model-len", "2048",
             "--gpu-memory-utilization", "0.85",
-            "--disable-log-requests",
+            "--no-enable-log-requests",
         ]
         if args.tp > 1:
             cmd += ["--tensor-parallel-size", str(args.tp)]
