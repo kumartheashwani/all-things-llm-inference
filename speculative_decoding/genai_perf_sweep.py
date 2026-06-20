@@ -435,6 +435,24 @@ CSV_FIELDS = [
 ]
 
 
+def load_existing_results(out_dir: str, mode: str, concurrencies: list) -> list:
+    """Load metrics from a previous sweep run without re-running genai-perf."""
+    rows = []
+    for c in concurrencies:
+        artifact_dir = os.path.join(out_dir, mode, f"concurrency_{c}")
+        metrics = parse_from_csv(artifact_dir)
+        if metrics:
+            row = SweepRow(concurrency=c, mode=mode, parsed_ok=True,
+                           **{k: metrics.get(k, 0.0) for k in
+                              ["ttft_avg_ms", "ttft_p99_ms", "itl_avg_ms",
+                               "itl_p99_ms", "output_tps", "request_tps"]})
+            rows.append(row)
+            print(f"  [loaded] concurrency={c}  output_tps={row.output_tps:.1f}")
+        else:
+            print(f"  [WARN] No saved results found for concurrency={c} in {artifact_dir}")
+    return rows
+
+
 def write_csv(baseline_rows: list, spec_rows: list, path: str):
     """Write combined CSV with speedup column."""
     baseline_by_c = {r.concurrency: r for r in baseline_rows}
@@ -590,6 +608,8 @@ def main():
     parser.add_argument("--out-dir",           default="sweep_results", dest="out_dir")
     parser.add_argument("--plot",              action="store_true",
                         help="Generate matplotlib chart (pip install matplotlib)")
+    parser.add_argument("--skip-baseline",     action="store_true", dest="skip_baseline",
+                        help="Load existing baseline results from --out-dir instead of re-running")
     # External server mode — skip server management
     parser.add_argument("--baseline-url",      default=None, dest="baseline_url",
                         help="URL of already-running baseline vLLM (e.g. localhost:8000)")
@@ -661,37 +681,31 @@ def main():
         hr()
         print("[1/2] BASELINE — autoregressive (no speculative decoding)")
         hr()
-        baseline_log = os.path.join(args.out_dir, "vllm_baseline.log")
-        cmd = [
-            sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-            "--model", args.target, "--port", str(args.port),
-            "--served-model-name", "baseline",
-            "--max-model-len", "2048",
-            "--gpu-memory-utilization", "0.85",
-            "--no-enable-log-requests",
-        ]
-        if args.tp > 1:
-            cmd += ["--tensor-parallel-size", str(args.tp)]
 
-        proc, log_fh = start_vllm(
-            args.target, args.port, "baseline",
-            tp=args.tp, log_path=baseline_log, env=env,
-        )
-        try:
-            if wait_for_server(args.port):
-                baseline_rows = sweep_server(
-                    genai_perf_bin,
-                    f"localhost:{args.port}",
-                    "baseline",
-                    "baseline",
-                    args.concurrencies,
-                    args.output_tokens, args.input_tokens, args.num_prompts,
-                    args.target, args.out_dir,
-                )
-            else:
-                print(f"  Baseline server failed. See {baseline_log}")
-        finally:
-            stop_vllm(proc, log_fh)
+        if args.skip_baseline:
+            print(f"  --skip-baseline: loading existing results from {args.out_dir}/baseline/")
+            baseline_rows = load_existing_results(args.out_dir, "baseline", args.concurrencies)
+        else:
+            baseline_log = os.path.join(args.out_dir, "vllm_baseline.log")
+            proc, log_fh = start_vllm(
+                args.target, args.port, "baseline",
+                tp=args.tp, log_path=baseline_log, env=env,
+            )
+            try:
+                if wait_for_server(args.port):
+                    baseline_rows = sweep_server(
+                        genai_perf_bin,
+                        f"localhost:{args.port}",
+                        "baseline",
+                        "baseline",
+                        args.concurrencies,
+                        args.output_tokens, args.input_tokens, args.num_prompts,
+                        args.target, args.out_dir,
+                    )
+                else:
+                    print(f"  Baseline server failed. See {baseline_log}")
+            finally:
+                stop_vllm(proc, log_fh)
 
         # 2. SPECULATIVE
         print()
