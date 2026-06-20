@@ -69,7 +69,6 @@ WHEN TO USE GENAI-PERF vs OTHER TOOLS
 import argparse
 import csv
 import glob
-import json
 import os
 import re
 import shutil
@@ -143,102 +142,71 @@ def check_vllm():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  METRICS PARSING — stdout (primary) + JSON artifact (secondary)
+#  METRICS PARSING — CSV artifact (primary) → stdout (fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _numbers_in(text: str):
-    """Extract all floats from a string."""
     return [float(x) for x in re.findall(r"[\d]+(?:\.[\d]+)?", text) if float(x) > 0]
 
 
-def parse_from_stdout(stdout: str) -> dict:
+def parse_from_csv(artifact_dir: str) -> dict:
     """
-    Parse genai-perf's rich-formatted stdout table.
+    Parse genai-perf's CSV summary file (primary strategy).
 
-    genai-perf prints a table like:
-      │ Time To First Token    │  234.56ms │ ...  │  305ms │ ...
-      │ Inter Token Latency    │   12.34ms │ ...  │   14ms │ ...
-      Output token throughput (per sec): 45.23
-      Request throughput (per sec): 0.30
-
-    Column order: avg, min, max, p99, p90, p75
+    genai-perf writes <profile_export_file>_genai_perf.csv with columns:
+      Metric, avg, min, max, p99, p90, p75, p50, p25
     """
+    csv_files = glob.glob(
+        os.path.join(artifact_dir, "**", "*_genai_perf.csv"), recursive=True
+    )
+    if not csv_files:
+        return {}
+
     metrics = {}
+    try:
+        with open(sorted(csv_files)[-1], newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                metric = row.get("Metric", "").lower()
+                def _f(col): return float(row.get(col) or 0)
 
+                if "time to first token" in metric:
+                    metrics["ttft_avg_ms"] = _f("avg")
+                    metrics["ttft_p99_ms"] = _f("p99")
+                elif "inter token latency" in metric:
+                    metrics["itl_avg_ms"] = _f("avg")
+                    metrics["itl_p99_ms"] = _f("p99")
+                elif "output token throughput" in metric:
+                    metrics["output_tps"] = _f("avg")
+                elif "request throughput" in metric:
+                    metrics["request_tps"] = _f("avg")
+    except Exception:
+        return {}
+
+    return metrics
+
+
+def parse_from_stdout(stdout: str) -> dict:
+    """Fallback: parse genai-perf's rich-table stdout output."""
+    metrics = {}
     for raw_line in stdout.splitlines():
-        # Strip unicode box-drawing chars so we get clean text + numbers
         line = re.sub(r"[│┃┡╇└─━┗┘╰╮╭╯┏┓┛━┯┷┼]", " ", raw_line).strip()
         lo   = line.lower()
 
         if "time to first token" in lo:
             nums = _numbers_in(line)
-            if nums:
-                metrics["ttft_avg_ms"] = nums[0]
-            if len(nums) >= 4:
-                metrics["ttft_p99_ms"] = nums[3]   # 4th column = p99
-
-        elif "inter token latency" in lo or "inter-token latency" in lo:
+            if nums:                  metrics["ttft_avg_ms"] = nums[0]
+            if len(nums) >= 4:        metrics["ttft_p99_ms"] = nums[3]
+        elif "inter token latency" in lo:
             nums = _numbers_in(line)
-            if nums:
-                metrics["itl_avg_ms"] = nums[0]
-            if len(nums) >= 4:
-                metrics["itl_p99_ms"] = nums[3]
-
+            if nums:                  metrics["itl_avg_ms"] = nums[0]
+            if len(nums) >= 4:        metrics["itl_p99_ms"] = nums[3]
         elif "output token throughput" in lo:
-            suffix = line.split(":")[-1] if ":" in line else line
-            nums = _numbers_in(suffix)
-            if nums:
-                metrics["output_tps"] = nums[0]
-
+            nums = _numbers_in(line.split(":")[-1])
+            if nums:                  metrics["output_tps"] = nums[0]
         elif "request throughput" in lo and "output" not in lo:
-            suffix = line.split(":")[-1] if ":" in line else line
-            nums = _numbers_in(suffix)
-            if nums:
-                metrics["request_tps"] = nums[0]
-
-    return metrics
-
-
-def parse_from_artifact(artifact_dir: str) -> dict:
-    """
-    Try to extract summary metrics from genai-perf's JSON artifact file.
-    Returns empty dict if not found — caller falls back to stdout parsing.
-    """
-    # genai-perf writes a summary JSON alongside profile_export.json
-    candidates = glob.glob(
-        os.path.join(artifact_dir, "**", "*genai_perf*.json"), recursive=True
-    )
-    candidates = [f for f in candidates if "profile_export" not in f]
-    if not candidates:
-        return {}
-
-    try:
-        with open(sorted(candidates)[-1]) as fh:
-            data = json.load(fh)
-    except Exception:
-        return {}
-
-    # Some versions wrap everything under "llm_metrics"
-    if "llm_metrics" in data:
-        data = data["llm_metrics"]
-
-    key_map = {
-        "time_to_first_token":     ("ttft_avg_ms", "ttft_p99_ms"),
-        "inter_token_latency":     ("itl_avg_ms",  "itl_p99_ms"),
-        "output_token_throughput": ("output_tps",  None),
-        "request_throughput":      ("request_tps", None),
-    }
-
-    metrics = {}
-    for jkey, (avg_k, p99_k) in key_map.items():
-        if jkey not in data:
-            continue
-        val = data[jkey]
-        if isinstance(val, dict):
-            if avg_k and "avg"  in val: metrics[avg_k] = float(val["avg"])
-            if p99_k and "p99"  in val: metrics[p99_k] = float(val["p99"])
-        elif isinstance(val, (int, float)):
-            if avg_k: metrics[avg_k] = float(val)
+            nums = _numbers_in(line.split(":")[-1])
+            if nums:                  metrics["request_tps"] = nums[0]
 
     return metrics
 
@@ -262,19 +230,20 @@ def run_genai_perf(
 
     cmd = [
         genai_perf_bin, "profile",
-        "--model",              served_model,
-        "--service-kind",       "openai",
-        "--endpoint-type",      "chat",
-        "--url",                server_url,
-        "--concurrency",        str(concurrency),
-        "--output-tokens-mean", str(output_tokens),
-        "--output-tokens-stddev", "0",
-        "--input-tokens-mean",  str(input_tokens),
-        "--input-tokens-stddev", "0",
-        "--num-prompts",        str(num_prompts),
-        "--tokenizer",          tokenizer,
-        "--artifact-dir",       artifact_dir,
-        "--profile-export-file", "profile_export.json",
+        "--model",                         served_model,
+        "--endpoint-type",                 "chat",
+        "--streaming",                     # required for TTFT / ITL metrics
+        "--url",                           server_url,
+        "--concurrency",                   str(concurrency),
+        "--output-tokens-mean",            str(output_tokens),
+        "--output-tokens-stddev",          "0",
+        "--synthetic-input-tokens-mean",   str(input_tokens),
+        "--synthetic-input-tokens-stddev", "0",
+        "--request-count",                 str(num_prompts),
+        "--warmup-request-count",          "3",
+        "--tokenizer",                     tokenizer,
+        "--artifact-dir",                  artifact_dir,
+        "--profile-export-file",           "profile_export.json",
     ]
 
     print(f"  Running genai-perf (concurrency={concurrency})...", end=" ", flush=True)
@@ -293,8 +262,8 @@ def run_genai_perf(
     with open(log_path) as fh:
         stdout = fh.read()
 
-    # Try JSON artifact first (most reliable), fall back to stdout
-    metrics = parse_from_artifact(artifact_dir) or parse_from_stdout(stdout)
+    # Try CSV artifact first (most reliable), fall back to stdout
+    metrics = parse_from_csv(artifact_dir) or parse_from_stdout(stdout)
 
     row = SweepRow(
         concurrency=concurrency,
