@@ -254,7 +254,7 @@ def run_genai_perf(
             cmd,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
-            timeout=300,
+            timeout=900,
         )
 
     elapsed = time.perf_counter() - t0
