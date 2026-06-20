@@ -289,6 +289,48 @@ def run_genai_perf(
 #  SERVER LIFECYCLE  (same pattern as bench_serving.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _speculative_args(draft_model: str, K: int, ngram: bool = False) -> list:
+    """
+    Build vLLM speculative-decoding CLI args, probing which flag style is installed.
+
+    Newest vLLM  : --spec-model / --spec-tokens / --spec-method
+    Middle vLLM  : --speculative-config '{"model": ..., "num_speculative_tokens": N}'
+    Legacy vLLM  : --speculative-model / --num-speculative-tokens
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--help"],
+        capture_output=True, text=True,
+    )
+    help_text = result.stdout + result.stderr
+
+    if "--spec-model" in help_text:
+        # Newest style: --spec-model / --spec-tokens / --spec-method
+        if ngram:
+            return ["--spec-method", "ngram", "--spec-tokens", str(K)]
+        return ["--spec-model", draft_model, "--spec-tokens", str(K)]
+
+    elif "--speculative-config" in help_text:
+        # JSON-based config
+        import json as _json
+        cfg: dict = {"num_speculative_tokens": K}
+        if ngram:
+            cfg["method"] = "ngram"
+            cfg["prompt_lookup_max"] = 4
+        else:
+            cfg["model"] = draft_model
+        return ["--speculative-config", _json.dumps(cfg)]
+
+    else:
+        # Legacy flags
+        if ngram:
+            return [
+                "--speculative-model",       "[ngram]",
+                "--num-speculative-tokens",  str(K),
+                "--ngram-prompt-lookup-max", "4",
+            ]
+        return ["--speculative-model", draft_model, "--num-speculative-tokens", str(K)]
+
+
 def start_vllm(target_model, port, served_name, extra_args=None, tp=1,
                log_path=None, env=None):
     cmd = [
@@ -659,16 +701,9 @@ def main():
         spec_log = os.path.join(args.out_dir, "vllm_speculative.log")
 
         if args.ngram:
-            spec_extra = [
-                "--speculative-model",      "[ngram]",
-                "--num-speculative-tokens", str(args.K),
-                "--ngram-prompt-lookup-max", "4",
-            ]
+            spec_extra = _speculative_args("[ngram]", args.K, ngram=True)
         else:
-            spec_extra = [
-                "--speculative-model",      args.draft,
-                "--num-speculative-tokens", str(args.K),
-            ]
+            spec_extra = _speculative_args(args.draft, args.K)
 
         proc, log_fh = start_vllm(
             args.target, args.port, "speculative",
